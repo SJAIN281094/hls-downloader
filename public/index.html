@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>HLS Stream Downloader</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #0f0f11;
+      --surface: #1a1a1f;
+      --surface2: #242429;
+      --border: #2e2e35;
+      --text: #e4e4e7;
+      --text-dim: #888891;
+      --accent: #818cf8;
+      --accent-hover: #6366f1;
+      --green: #34d399;
+      --red: #f87171;
+      --orange: #fbbf24;
+      --radius: 12px;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      align-items: flex-start;
+      justify-content: center;
+      padding: 60px 20px;
+    }
+
+    .container {
+      width: 100%;
+      max-width: 680px;
+    }
+
+    h1 {
+      font-size: 1.75rem;
+      font-weight: 700;
+      margin-bottom: 4px;
+      letter-spacing: -0.02em;
+    }
+
+    .subtitle {
+      color: var(--text-dim);
+      font-size: 0.9rem;
+      margin-bottom: 32px;
+    }
+
+    .input-group {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 20px;
+      margin-bottom: 16px;
+    }
+
+    .input-group label {
+      display: block;
+      font-size: 0.8rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-dim);
+      margin-bottom: 10px;
+    }
+
+    textarea {
+      width: 100%;
+      min-height: 160px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--text);
+      font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+      font-size: 0.8rem;
+      padding: 14px;
+      resize: vertical;
+      line-height: 1.6;
+      transition: border-color 0.2s;
+    }
+
+    textarea:focus {
+      outline: none;
+      border-color: var(--accent);
+    }
+
+    textarea::placeholder {
+      color: #555;
+    }
+
+    .row {
+      display: flex;
+      gap: 12px;
+      align-items: flex-end;
+    }
+
+    .filename-wrap {
+      flex: 1;
+    }
+
+    .filename-wrap label {
+      display: block;
+      font-size: 0.75rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-dim);
+      margin-bottom: 6px;
+    }
+
+    .filename-wrap input {
+      width: 100%;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--text);
+      font-size: 0.85rem;
+      padding: 10px 14px;
+      transition: border-color 0.2s;
+    }
+
+    .filename-wrap input:focus {
+      outline: none;
+      border-color: var(--accent);
+    }
+
+    .filename-wrap input::placeholder { color: #555; }
+
+    button.primary {
+      background: var(--accent);
+      color: #fff;
+      border: none;
+      border-radius: 8px;
+      padding: 10px 28px;
+      font-size: 0.9rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.2s;
+      white-space: nowrap;
+      height: 42px;
+    }
+
+    button.primary:hover { background: var(--accent-hover); }
+    button.primary:disabled {
+      opacity: 0.4;
+      cursor: not-allowed;
+    }
+
+    /* Job cards */
+    .jobs { margin-top: 24px; display: flex; flex-direction: column; gap: 12px; }
+
+    .job-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 18px 20px;
+      animation: slideIn 0.3s ease;
+    }
+
+    @keyframes slideIn {
+      from { opacity: 0; transform: translateY(8px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    .job-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 12px;
+    }
+
+    .job-filename {
+      font-weight: 600;
+      font-size: 0.9rem;
+    }
+
+    .badge {
+      font-size: 0.7rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      padding: 3px 10px;
+      border-radius: 20px;
+    }
+
+    .badge.downloading {
+      background: rgba(129, 140, 248, 0.15);
+      color: var(--accent);
+    }
+
+    .badge.done {
+      background: rgba(52, 211, 153, 0.15);
+      color: var(--green);
+    }
+
+    .badge.error, .badge.cancelled {
+      background: rgba(248, 113, 113, 0.15);
+      color: var(--red);
+    }
+
+    .progress-bar-wrap {
+      width: 100%;
+      height: 4px;
+      background: var(--surface2);
+      border-radius: 2px;
+      overflow: hidden;
+      margin-bottom: 10px;
+    }
+
+    .progress-bar-inner {
+      height: 100%;
+      background: var(--accent);
+      border-radius: 2px;
+      animation: pulse 1.5s ease-in-out infinite;
+      width: 40%;
+    }
+
+    .progress-bar-inner.done {
+      width: 100%;
+      background: var(--green);
+      animation: none;
+    }
+
+    .progress-bar-inner.error {
+      width: 100%;
+      background: var(--red);
+      animation: none;
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 0.6; transform: translateX(-60%); }
+      50% { opacity: 1; transform: translateX(150%); }
+    }
+
+    .job-meta {
+      display: flex;
+      gap: 20px;
+      font-size: 0.8rem;
+      color: var(--text-dim);
+    }
+
+    .job-meta span strong { color: var(--text); }
+
+    .job-actions {
+      display: flex;
+      gap: 8px;
+      margin-top: 12px;
+    }
+
+    .job-actions a, .job-actions button {
+      font-size: 0.8rem;
+      font-weight: 600;
+      padding: 6px 16px;
+      border-radius: 6px;
+      cursor: pointer;
+      text-decoration: none;
+      border: none;
+    }
+
+    .btn-download {
+      background: var(--green);
+      color: #0f0f11;
+    }
+
+    .btn-cancel {
+      background: var(--surface2);
+      color: var(--text-dim);
+      border: 1px solid var(--border) !important;
+    }
+
+    .btn-cancel:hover { color: var(--red); border-color: var(--red) !important; }
+
+    .error-text {
+      font-family: monospace;
+      font-size: 0.75rem;
+      color: var(--red);
+      background: rgba(248, 113, 113, 0.08);
+      padding: 10px;
+      border-radius: 6px;
+      margin-top: 8px;
+      max-height: 100px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>HLS Downloader</h1>
+    <p class="subtitle">Paste a .m3u8 URL or a full curl command to download the stream as MP4.</p>
+
+    <div class="input-group">
+      <label>Curl command or .m3u8 URL</label>
+      <textarea id="curlInput" placeholder="curl 'https://example.com/stream/index.m3u8?token=...' \
+  -H 'referer: https://example.com/' \
+  -b 'session=abc123'
+
+or just:
+
+https://example.com/stream/index.m3u8"></textarea>
+    </div>
+
+    <div class="row" style="padding: 0 0 0 0;">
+      <div class="filename-wrap">
+        <label>Output filename (optional)</label>
+        <input type="text" id="filenameInput" placeholder="my-video" />
+      </div>
+      <button class="primary" id="downloadBtn" onclick="startDownload()">Download</button>
+    </div>
+
+    <div class="jobs" id="jobs"></div>
+  </div>
+
+  <script>
+    const pollIntervals = {};
+
+    async function startDownload() {
+      const input = document.getElementById("curlInput").value.trim();
+      if (!input) return;
+
+      const filename = document.getElementById("filenameInput").value.trim();
+      const btn = document.getElementById("downloadBtn");
+      btn.disabled = true;
+      btn.textContent = "Starting…";
+
+      try {
+        const res = await fetch("/api/download", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ input, filename }),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          alert(data.error || "Failed to start download");
+          return;
+        }
+        addJobCard(data.jobId, data.filename);
+        pollStatus(data.jobId);
+        document.getElementById("curlInput").value = "";
+        document.getElementById("filenameInput").value = "";
+      } catch (e) {
+        alert("Server error: " + e.message);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "Download";
+      }
+    }
+
+    function addJobCard(id, filename) {
+      const container = document.getElementById("jobs");
+      const card = document.createElement("div");
+      card.className = "job-card";
+      card.id = `job-${id}`;
+      card.innerHTML = `
+        <div class="job-header">
+          <span class="job-filename">${filename}</span>
+          <span class="badge downloading" id="badge-${id}">Downloading</span>
+        </div>
+        <div class="progress-bar-wrap">
+          <div class="progress-bar-inner" id="bar-${id}"></div>
+        </div>
+        <div class="job-meta" id="meta-${id}">
+          <span>Elapsed: <strong>0s</strong></span>
+        </div>
+        <div class="job-actions" id="actions-${id}">
+          <button class="btn-cancel" onclick="cancelJob('${id}')">Cancel</button>
+        </div>
+      `;
+      container.prepend(card);
+    }
+
+    function formatSize(bytes) {
+      if (bytes < 1024) return bytes + " B";
+      if (bytes < 1048576) return (bytes / 1024).toFixed(1) + " KB";
+      if (bytes < 1073741824) return (bytes / 1048576).toFixed(1) + " MB";
+      return (bytes / 1073741824).toFixed(2) + " GB";
+    }
+
+    function formatDuration(secs) {
+      const m = Math.floor(secs / 60);
+      const s = secs % 60;
+      return m > 0 ? `${m}m ${s}s` : `${s}s`;
+    }
+
+    function pollStatus(id) {
+      pollIntervals[id] = setInterval(async () => {
+        try {
+          const res = await fetch(`/api/status/${id}`);
+          const data = await res.json();
+          updateJobCard(data);
+          if (data.status === "done" || data.status === "error" || data.status === "cancelled") {
+            clearInterval(pollIntervals[id]);
+          }
+        } catch { /* ignore */ }
+      }, 1000);
+    }
+
+    function updateJobCard(data) {
+      const badge = document.getElementById(`badge-${data.id}`);
+      const bar = document.getElementById(`bar-${data.id}`);
+      const meta = document.getElementById(`meta-${data.id}`);
+      const actions = document.getElementById(`actions-${data.id}`);
+      if (!badge) return;
+
+      badge.textContent = data.status === "done" ? "Complete" : data.status.charAt(0).toUpperCase() + data.status.slice(1);
+      badge.className = `badge ${data.status}`;
+
+      if (data.status === "done") {
+        bar.className = "progress-bar-inner done";
+        meta.innerHTML = `
+          <span>Duration: <strong>${data.progress || "—"}</strong></span>
+          <span>Size: <strong>${formatSize(data.fileSize)}</strong></span>
+          <span>Took: <strong>${formatDuration(data.elapsed)}</strong></span>
+        `;
+        actions.innerHTML = `<a class="btn-download" href="${data.downloadUrl}" download>Save File</a>`;
+      } else if (data.status === "error" || data.status === "cancelled") {
+        bar.className = `progress-bar-inner error`;
+        actions.innerHTML = "";
+        if (data.error) {
+          const card = document.getElementById(`job-${data.id}`);
+          if (!card.querySelector(".error-text")) {
+            const errDiv = document.createElement("div");
+            errDiv.className = "error-text";
+            errDiv.textContent = data.error;
+            card.appendChild(errDiv);
+          }
+        }
+      } else {
+        let parts = [`<span>Elapsed: <strong>${formatDuration(data.elapsed)}</strong></span>`];
+        if (data.progress) parts.push(`<span>Time: <strong>${data.progress}</strong></span>`);
+        if (data.speed) parts.push(`<span>Speed: <strong>${data.speed}</strong></span>`);
+        meta.innerHTML = parts.join("");
+      }
+    }
+
+    async function cancelJob(id) {
+      await fetch(`/api/cancel/${id}`, { method: "POST" });
+    }
+
+    // Allow Ctrl+Enter to submit
+    document.getElementById("curlInput").addEventListener("keydown", (e) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === "Enter") startDownload();
+    });
+  </script>
+</body>
+</html>
