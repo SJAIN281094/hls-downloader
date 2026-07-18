@@ -131,6 +131,29 @@
 
     .filename-wrap input::placeholder { color: #555; }
 
+    .filename-wrap select {
+      width: 100%;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--text);
+      font-size: 0.85rem;
+      padding: 10px 14px;
+      transition: border-color 0.2s;
+      appearance: none;
+      cursor: pointer;
+    }
+
+    .filename-wrap select:focus {
+      outline: none;
+      border-color: var(--accent);
+    }
+
+    .badge.queued {
+      background: rgba(251, 191, 36, 0.15);
+      color: var(--orange);
+    }
+
     button.primary {
       background: var(--accent);
       color: #fff;
@@ -293,7 +316,8 @@
 <body>
   <div class="container">
     <h1>HLS Downloader</h1>
-    <p class="subtitle">Paste a .m3u8 URL or a full curl command to download the stream as MP4.</p>
+    <p class="subtitle">Paste a full curl command from Chrome DevTools (Network → index.m3u8 → Copy as cURL) while the video is playing.</p>
+    <p class="subtitle" style="margin-top:-0.75rem;color:#a78bfa">For <strong>master.dev</strong>: include the full <code>-b</code> cookie line. Downloads use a headless browser to fetch encrypted segments (~5–10 min).</p>
 
     <div class="input-group">
       <label>Curl command or .m3u8 URL</label>
@@ -311,6 +335,15 @@ https://example.com/stream/index.m3u8"></textarea>
         <label>Output filename (optional)</label>
         <input type="text" id="filenameInput" placeholder="my-video" />
       </div>
+      <div class="filename-wrap" style="max-width: 150px;">
+        <label>Download speed</label>
+        <select id="speedInput">
+          <option value="1" selected>1x (safest)</option>
+          <option value="1.5">1.5x</option>
+          <option value="2">2x</option>
+          <option value="3">3x (risky)</option>
+        </select>
+      </div>
       <button class="primary" id="downloadBtn" onclick="startDownload()">Download</button>
     </div>
 
@@ -325,6 +358,7 @@ https://example.com/stream/index.m3u8"></textarea>
       if (!input) return;
 
       const filename = document.getElementById("filenameInput").value.trim();
+      const speed = document.getElementById("speedInput").value;
       const btn = document.getElementById("downloadBtn");
       btn.disabled = true;
       btn.textContent = "Starting…";
@@ -333,7 +367,7 @@ https://example.com/stream/index.m3u8"></textarea>
         const res = await fetch("/api/download", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ input, filename }),
+          body: JSON.stringify({ input, filename, speed }),
         });
         const data = await res.json();
         if (!res.ok) {
@@ -408,10 +442,13 @@ https://example.com/stream/index.m3u8"></textarea>
       const actions = document.getElementById(`actions-${data.id}`);
       if (!badge) return;
 
-      badge.textContent = data.status === "done" ? "Complete" : data.status.charAt(0).toUpperCase() + data.status.slice(1);
+      const labels = { done: "Complete", downloading: "Downloading", queued: "Queued", error: "Error", cancelled: "Cancelled" };
+      badge.textContent = labels[data.status] || data.status;
       badge.className = `badge ${data.status}`;
 
-      if (data.status === "done") {
+      if (data.status === "queued") {
+        meta.innerHTML = `<span>Waiting in queue… <strong>(${data.readRate}x throttle)</strong></span>`;
+      } else if (data.status === "done") {
         bar.className = "progress-bar-inner done";
         meta.innerHTML = `
           <span>Duration: <strong>${data.progress || "—"}</strong></span>
@@ -435,6 +472,7 @@ https://example.com/stream/index.m3u8"></textarea>
         let parts = [`<span>Elapsed: <strong>${formatDuration(data.elapsed)}</strong></span>`];
         if (data.progress) parts.push(`<span>Time: <strong>${data.progress}</strong></span>`);
         if (data.speed) parts.push(`<span>Speed: <strong>${data.speed}</strong></span>`);
+        parts.push(`<span>Throttle: <strong>${data.readRate}x</strong></span>`);
         meta.innerHTML = parts.join("");
       }
     }
