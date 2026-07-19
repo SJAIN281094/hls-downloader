@@ -93,6 +93,12 @@ function normalizeParsedInput(parsed) {
 
     const expires = u.searchParams.get("Expires");
     parsed.signatureExpired = !!(expires && Date.now() / 1000 > Number(expires));
+
+    // CloudFront cookies outlast signed-URL query params; cookies alone fetch playlists.
+    if (hasCloudFrontCookies(parsed.cookies)) {
+      u.search = "";
+      parsed.url = u.toString();
+    }
   } catch {
     parsed.authQuery = "";
     parsed.signatureExpired = false;
@@ -224,7 +230,7 @@ function detectPathPrefix(playlistUrl, probeSegmentUrl) {
   return match ? match[1] : "";
 }
 
-function resolvePlaylistLine(line, playlistUrl, pathPrefix, authQuery) {
+function resolvePlaylistLine(line, playlistUrl, pathPrefix, segmentAuthQuery) {
   const trimmed = line.trim();
   if (!trimmed || trimmed.startsWith("#")) return line;
 
@@ -247,26 +253,34 @@ function resolvePlaylistLine(line, playlistUrl, pathPrefix, authQuery) {
     return line;
   }
 
-  if (isSegment && authQuery && !resolved.search) {
-    resolved.search = authQuery.startsWith("?") ? authQuery.slice(1) : authQuery;
+  // CloudFront cookies authenticate segments; the m3u8 Signature breaks segment requests.
+  if (isSegment && segmentAuthQuery && !resolved.search) {
+    resolved.search = segmentAuthQuery.startsWith("?")
+      ? segmentAuthQuery.slice(1)
+      : segmentAuthQuery;
   }
 
   return resolved.toString();
 }
 
-function firstSegmentUrl(playlistBody, playlistUrl, pathPrefix, authQuery) {
+function segmentAuthQueryFor(parsed) {
+  if (hasCloudFrontCookies(parsed.cookies)) return "";
+  return parsed.authQuery || "";
+}
+
+function firstSegmentUrl(playlistBody, playlistUrl, pathPrefix, segmentAuthQuery) {
   for (const line of playlistBody.split("\n")) {
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith("#")) continue;
-    return resolvePlaylistLine(trimmed, playlistUrl, pathPrefix, authQuery);
+    return resolvePlaylistLine(trimmed, playlistUrl, pathPrefix, segmentAuthQuery);
   }
   return null;
 }
 
-function rewritePlaylist(body, playlistUrl, pathPrefix, authQuery) {
+function rewritePlaylist(body, playlistUrl, pathPrefix, segmentAuthQuery) {
   return body
     .split("\n")
-    .map((line) => resolvePlaylistLine(line, playlistUrl, pathPrefix, authQuery))
+    .map((line) => resolvePlaylistLine(line, playlistUrl, pathPrefix, segmentAuthQuery))
     .join("\n");
 }
 
@@ -328,6 +342,18 @@ function isMasterDevStream(url) {
   }
 }
 
+function isFrontendMastersStream(url) {
+  try {
+    return /stream\.frontendmasters\.com/i.test(new URL(url).hostname);
+  } catch {
+    return false;
+  }
+}
+
+function isBrowserDownloadStream(url) {
+  return isMasterDevStream(url);
+}
+
 function isTsSegmentUrl(url) {
   try {
     return /\.ts$/i.test(new URL(url).pathname);
@@ -361,6 +387,13 @@ async function prepareHlsInput(parsed) {
     if (!parsed.headers.referer && !parsed.headers.Referer) {
       parsed.headers.referer = "https://master.dev/";
     }
+  } else if (isFrontendMastersStream(parsed.url)) {
+    if (!parsed.headers.origin && !parsed.headers.Origin) {
+      parsed.headers.origin = "https://frontendmasters.com";
+    }
+    if (!parsed.headers.referer && !parsed.headers.Referer) {
+      parsed.headers.referer = "https://frontendmasters.com/";
+    }
   }
 
   // User pasted a .ts segment curl — derive the variant playlist from it.
@@ -382,6 +415,7 @@ async function prepareHlsInput(parsed) {
   const playlistUrl = new URL(parsed.url);
   const pathPrefix = detectPathPrefix(playlistUrl, probeSegmentUrl);
   const authQuery = parsed.authQuery || playlistUrl.search;
+  const segAuth = segmentAuthQueryFor(parsed);
   const masterDev = isMasterDevStream(parsed.url);
 
   let fetched;
@@ -427,11 +461,11 @@ async function prepareHlsInput(parsed) {
     }
   }
 
-  const rewritten = rewritePlaylist(body, new URL(sourceUrl), pathPrefix, authQuery);
+  const rewritten = rewritePlaylist(body, new URL(sourceUrl), pathPrefix, segAuth);
 
   const segmentUrl =
     probeSegmentUrl ||
-    firstSegmentUrl(rewritten, new URL(sourceUrl), pathPrefix, authQuery);
+    firstSegmentUrl(rewritten, new URL(sourceUrl), pathPrefix, segAuth);
 
   if (masterDev) {
     if (segmentUrl) {
@@ -458,8 +492,11 @@ async function prepareHlsInput(parsed) {
     }
   }
 
-  if (rewritten === body && !pathPrefix && !authQuery) {
-    return { inputUrl: parsed.url, cleanup: null };
+  // ffmpeg does not reliably pass -headers (cookies) to HLS segment requests when
+  // the input is a local .m3u8 file. Use the remote playlist when no path/auth
+  // rewriting is required (e.g. frontendmasters.com with CloudFront cookies).
+  if (!pathPrefix && !segAuth) {
+    return { inputUrl: sourceUrl, cleanup: null };
   }
 
   const tmpPath = path.join(
@@ -512,7 +549,7 @@ app.post("/api/download", async (req, res) => {
   };
   activeJobs.set(jobId, job);
 
-  if (isMasterDevStream(parsed.url)) {
+  if (isBrowserDownloadStream(parsed.url)) {
     function startBrowserJob() {
       job.status = "downloading";
       job.startedAt = Date.now();
@@ -556,7 +593,7 @@ app.post("/api/download", async (req, res) => {
   function buildFfmpegArgs(inputUrl) {
     const headerParts = [];
     for (const [k, v] of Object.entries(parsed.headers)) {
-      if (/^sec-|^accept$|^accept-language$/i.test(k)) continue;
+      if (/^sec-|^accept$|^accept-language$|^priority$/i.test(k)) continue;
       headerParts.push(`${k}: ${v}`);
     }
     if (parsed.cookies) {
@@ -598,10 +635,13 @@ app.post("/api/download", async (req, res) => {
     let stderr = "";
     proc.stderr.on("data", (chunk) => {
       stderr += chunk.toString();
-      const timeMatch = stderr.match(/time=(\d{2}:\d{2}:\d{2}\.\d{2})/g);
+      const timeMatch = stderr.match(/time=(\d{2}:\d{2}:\d{2}(?:\.\d+)?)/g);
       if (timeMatch) job.progress = timeMatch[timeMatch.length - 1].replace("time=", "");
       const speedMatch = stderr.match(/speed=\s*([^\s]+)/g);
       if (speedMatch) job.speed = speedMatch[speedMatch.length - 1].replace("speed=", "").trim();
+      if (!job.progress && /Opening 'crypto/i.test(stderr)) {
+        job.progress = "Fetching segments…";
+      }
     });
 
     proc.on("close", (code) => {

@@ -316,8 +316,8 @@
 <body>
   <div class="container">
     <h1>HLS Downloader</h1>
-    <p class="subtitle">Paste a full curl command from Chrome DevTools (Network → index.m3u8 → Copy as cURL) while the video is playing.</p>
-    <p class="subtitle" style="margin-top:-0.75rem;color:#a78bfa">For <strong>master.dev</strong>: include the full <code>-b</code> cookie line. Downloads use a headless browser to fetch encrypted segments (~5–10 min).</p>
+    <p class="subtitle">Paste a full curl command from Chrome DevTools (Network → index.m3u8 → Copy as cURL) while the video is playing. Include the <code>-b</code> cookie line.</p>
+    <p class="subtitle" style="margin-top:-0.75rem;color:#a78bfa"><strong>frontendmasters.com</strong> downloads directly. <strong>master.dev</strong> uses a headless browser (~5–10 min).</p>
 
     <div class="input-group">
       <label>Curl command or .m3u8 URL</label>
@@ -469,8 +469,17 @@ https://example.com/stream/index.m3u8"></textarea>
           }
         }
       } else {
+        bar.className = "progress-bar-inner";
         let parts = [`<span>Elapsed: <strong>${formatDuration(data.elapsed)}</strong></span>`];
-        if (data.progress) parts.push(`<span>Time: <strong>${data.progress}</strong></span>`);
+        if (data.progress) {
+          if (/^\d{2}:\d{2}:\d{2}/.test(data.progress)) {
+            parts.push(`<span>Time: <strong>${data.progress}</strong></span>`);
+          } else {
+            parts.push(`<span><strong>${data.progress}</strong></span>`);
+          }
+        } else {
+          parts.push(`<span><strong>Downloading…</strong></span>`);
+        }
         if (data.speed) parts.push(`<span>Speed: <strong>${data.speed}</strong></span>`);
         parts.push(`<span>Throttle: <strong>${data.readRate}x</strong></span>`);
         meta.innerHTML = parts.join("");
