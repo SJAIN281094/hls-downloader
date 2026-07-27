@@ -769,6 +769,7 @@ function runCourseJob(job, authParsed) {
     prepareHlsInput,
     normalizeParsedInput,
     downloadsDir: DOWNLOADS_DIR,
+    downloadMasterDevVideo,
   }, {
     readRate: job.readRate,
     signal: job.abortController.signal,
@@ -826,7 +827,7 @@ app.post("/api/download-course", async (req, res) => {
   const authParsed = parseCurlCommand(input);
   if (!authParsed.cookies || !/fem_auth_mod=/.test(authParsed.cookies)) {
     return res.status(400).json({
-      error: "Curl must include fem_auth_mod — copy it while logged in on frontendmasters.com.",
+      error: "Curl must include fem_auth_mod — copy it while logged in on frontendmasters.com or master.dev.",
     });
   }
   if (!/FM_EMCS=/.test(authParsed.cookies)) {

@@ -72,35 +72,45 @@ function parseCourseUrl(courseUrl) {
     throw new Error("Invalid course URL");
   }
   const match = u.pathname.match(/\/courses\/([^/]+)\/?/);
-  if (!match) throw new Error("URL must be like https://frontendmasters.com/courses/my-course/");
-  if (!/^(www\.)?frontendmasters\.com$/i.test(u.hostname)) {
-    throw new Error("Batch download supports frontendmasters.com only");
+  if (!match) {
+    throw new Error("URL must be like https://frontendmasters.com/courses/my-course/ or https://master.dev/courses/my-course/");
   }
-  return { slug: match[1], siteHost: "frontendmasters.com", apiHost: "api.frontendmasters.com" };
+  const isFm = /^(www\.)?frontendmasters\.com$/i.test(u.hostname);
+  const isMd = /^(www\.)?master\.dev$/i.test(u.hostname);
+  if (!isFm && !isMd) {
+    throw new Error("Batch download supports frontendmasters.com and master.dev only");
+  }
+  return {
+    slug: match[1],
+    siteHost: isFm ? "frontendmasters.com" : "master.dev",
+    apiHost: isFm ? "api.frontendmasters.com" : "api.master.dev",
+  };
 }
 
-function apiParsed(authParsed, courseSlug, lessonSlug) {
+function apiParsed(authParsed, courseMeta, courseSlug, lessonSlug) {
+  const { siteHost } = courseMeta;
   const referer = lessonSlug
-    ? `https://frontendmasters.com/courses/${courseSlug}/${lessonSlug}/`
-    : `https://frontendmasters.com/courses/${courseSlug}/`;
+    ? `https://${siteHost}/courses/${courseSlug}/${lessonSlug}/`
+    : `https://${siteHost}/courses/${courseSlug}/`;
   return {
     ...authParsed,
     headers: {
       ...authParsed.headers,
       Accept: "application/json",
-      origin: "https://frontendmasters.com",
+      origin: `https://${siteHost}`,
       referer,
     },
   };
 }
 
-function lessonAuthParsed(authParsed, m3u8Url, courseSlug, lessonSlug) {
+function lessonAuthParsed(authParsed, m3u8Url, courseMeta, courseSlug, lessonSlug) {
+  const { siteHost } = courseMeta;
   return {
     url: m3u8Url,
     headers: {
       ...authParsed.headers,
-      origin: "https://frontendmasters.com",
-      referer: `https://frontendmasters.com/courses/${courseSlug}/${lessonSlug}/`,
+      origin: `https://${siteHost}`,
+      referer: `https://${siteHost}/courses/${courseSlug}/${lessonSlug}/`,
     },
     cookies: authParsed.cookies,
     authQuery: "",
@@ -108,17 +118,18 @@ function lessonAuthParsed(authParsed, m3u8Url, courseSlug, lessonSlug) {
   };
 }
 
-function formatApiError(err, lesson) {
+function formatApiError(err, lesson, siteHost) {
+  const site = siteHost || "frontendmasters.com";
   if (err.statusCode === 401) {
     const title = lesson?.title ? ` (“${lesson.title}”)` : "";
     return (
       `Not authorized for lesson${title} (HTTP 401). ` +
-      `Open that lesson on frontendmasters.com while logged in, copy a fresh curl ` +
+      `Open that lesson on ${site} while logged in, copy a fresh curl ` +
       `(must include fem_auth_mod and FM_EMCS), then Retry.`
     );
   }
   if (err.statusCode === 429) {
-    return "Frontend Masters API rate limit (429). Wait 1–2 minutes, then Retry.";
+    return "API rate limit (429). Wait 1–2 minutes, then Retry.";
   }
   return err.message || String(err);
 }
@@ -127,7 +138,7 @@ async function discoverLessons(authParsed, courseMeta, onRetry) {
   const { slug, apiHost } = courseMeta;
   const data = await fetchJson(
     `https://${apiHost}/v2/kabuki/courses/${slug}`,
-    apiParsed(authParsed, slug),
+    apiParsed(authParsed, courseMeta, slug),
     { retries: 4, onRetry }
   );
 
@@ -145,17 +156,17 @@ async function discoverLessons(authParsed, courseMeta, onRetry) {
 }
 
 async function fetchLessonM3u8(authParsed, courseMeta, lesson, onRetry) {
-  const { slug, apiHost } = courseMeta;
+  const { slug, apiHost, siteHost } = courseMeta;
   try {
     const source = await fetchJson(
       `https://${apiHost}/v2/kabuki/video/${lesson.hash}/source?f=m3u8`,
-      apiParsed(authParsed, slug, lesson.slug),
+      apiParsed(authParsed, courseMeta, slug, lesson.slug),
       { retries: 12, onRetry }
     );
     if (!source?.url) throw new Error(`No stream URL for lesson: ${lesson.title}`);
     return source.url;
   } catch (err) {
-    throw new Error(formatApiError(err, lesson));
+    throw new Error(formatApiError(err, lesson, siteHost));
   }
 }
 
@@ -184,10 +195,11 @@ function existingLessonFile(courseDir, index, lesson) {
 }
 
 async function downloadCourse(authParsed, courseUrl, deps, options = {}) {
-  const { prepareHlsInput, normalizeParsedInput, downloadsDir } = deps;
+  const { prepareHlsInput, normalizeParsedInput, downloadsDir, downloadMasterDevVideo } = deps;
   const { onProgress, onLessonComplete, readRate = 2, signal } = options;
 
   const courseMeta = parseCourseUrl(courseUrl);
+  const isMasterDev = courseMeta.siteHost === "master.dev";
   onProgress?.({ phase: "discover", message: "Fetching lesson list…" });
 
   const onApiRetry = (info) => {
@@ -242,56 +254,75 @@ async function downloadCourse(authParsed, courseUrl, deps, options = {}) {
       phase: "lesson",
       lessonIndex: index,
       lessonTotal: lessons.length,
-      message: `Lesson ${index}/${lessons.length}: ${lesson.title} (resolving stream…)`,
+      message: `Lesson ${index}/${lessons.length}: ${lesson.title}${isMasterDev ? " (browser…)" : " (resolving stream…)"}`,
     });
 
-    await throttleKabukiApi();
-
-    const lessonApiRetry = (info) => {
-      onProgress?.({
-        phase: "lesson",
-        lessonIndex: index,
-        lessonTotal: lessons.length,
-        message: `Lesson ${index}/${lessons.length}: rate limited — retry in ${Math.ceil(info.waitMs / 1000)}s…`,
-      });
-    };
-
-    const m3u8Url = await fetchLessonM3u8(authParsed, courseMeta, lesson, lessonApiRetry);
-
-    onProgress?.({
-      phase: "lesson",
-      lessonIndex: index,
-      lessonTotal: lessons.length,
-      message: `Lesson ${index}/${lessons.length}: ${lesson.title}`,
-    });
-
-    let lessonParsed = lessonAuthParsed(authParsed, m3u8Url, slug, lesson.slug);
-    if (normalizeParsedInput) lessonParsed = normalizeParsedInput(lessonParsed);
-
-    const prepared = await prepareHlsInput(lessonParsed);
-
-    await downloadFrontendMastersParallel(lessonParsed, outPath, prepared, {
-      readRate,
-      signal,
-      onProgress: (info) => {
-        if (info.phase === "mux") {
-          onProgress?.({
-            phase: "mux",
-            lessonIndex: index,
-            lessonTotal: lessons.length,
-            message: `Lesson ${index}/${lessons.length}: Muxing…`,
-          });
-          return;
-        }
+    if (isMasterDev) {
+      if (!downloadMasterDevVideo) {
+        throw new Error("master.dev browser downloader not configured");
+      }
+      const lessonPageUrl = `https://master.dev/courses/${slug}/${lesson.slug}/`;
+      await downloadMasterDevVideo(authParsed, outPath, (msg) => {
         onProgress?.({
           phase: "segments",
           lessonIndex: index,
           lessonTotal: lessons.length,
-          speed: info.speed,
-          message: `Lesson ${index}/${lessons.length}: ${info.done}/${info.total} segments`,
+          message: `Lesson ${index}/${lessons.length}: ${msg}`,
         });
-      },
-    });
+      }, {
+        coursePageUrl: lessonPageUrl,
+        videoHash: lesson.hash,
+        signal,
+      });
+    } else {
+      await throttleKabukiApi();
+
+      const lessonApiRetry = (info) => {
+        onProgress?.({
+          phase: "lesson",
+          lessonIndex: index,
+          lessonTotal: lessons.length,
+          message: `Lesson ${index}/${lessons.length}: rate limited — retry in ${Math.ceil(info.waitMs / 1000)}s…`,
+        });
+      };
+
+      const m3u8Url = await fetchLessonM3u8(authParsed, courseMeta, lesson, lessonApiRetry);
+
+      onProgress?.({
+        phase: "lesson",
+        lessonIndex: index,
+        lessonTotal: lessons.length,
+        message: `Lesson ${index}/${lessons.length}: ${lesson.title}`,
+      });
+
+      let lessonParsed = lessonAuthParsed(authParsed, m3u8Url, courseMeta, slug, lesson.slug);
+      if (normalizeParsedInput) lessonParsed = normalizeParsedInput(lessonParsed);
+
+      const prepared = await prepareHlsInput(lessonParsed);
+
+      await downloadFrontendMastersParallel(lessonParsed, outPath, prepared, {
+        readRate,
+        signal,
+        onProgress: (info) => {
+          if (info.phase === "mux") {
+            onProgress?.({
+              phase: "mux",
+              lessonIndex: index,
+              lessonTotal: lessons.length,
+              message: `Lesson ${index}/${lessons.length}: Muxing…`,
+            });
+            return;
+          }
+          onProgress?.({
+            phase: "segments",
+            lessonIndex: index,
+            lessonTotal: lessons.length,
+            speed: info.speed,
+            message: `Lesson ${index}/${lessons.length}: ${info.done}/${info.total} segments`,
+          });
+        },
+      });
+    }
 
     const entry = {
       slug: lesson.slug,

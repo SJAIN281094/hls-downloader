@@ -80,9 +80,12 @@ async function downloadSegment(page, variantUrl, segmentPath) {
   return Buffer.from(b64, "base64");
 }
 
-async function downloadMasterDevVideo(parsed, outPath, onProgress) {
-  const videoHash = extractVideoHash(parsed.url);
+async function downloadMasterDevVideo(parsed, outPath, onProgress, options = {}) {
+  const { coursePageUrl, videoHash: hashOverride, signal } = options;
+  const videoHash = hashOverride || extractVideoHash(parsed.url);
   if (!videoHash) throw new Error("Could not extract video hash from URL");
+
+  if (signal?.aborted) throw new Error("cancelled");
 
   const cookies = parseCookiesFromParsed(parsed);
   const workDir = path.join(path.dirname(outPath), `work-${Date.now()}`);
@@ -93,68 +96,87 @@ async function downloadMasterDevVideo(parsed, outPath, onProgress) {
     parsed.headers["user-agent"] ||
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
+  const pageUrl = coursePageUrl || COURSE_URL;
   const browser = await chromium.launch({ headless: true });
   const context = await browser.newContext({ userAgent });
   if (cookies.length) await context.addCookies(cookies);
 
   const page = await context.newPage();
-  onProgress?.("Opening course page in browser...");
-  await page.goto(COURSE_URL, { waitUntil: "networkidle", timeout: 120000 });
 
-  onProgress?.("Fetching playlist...");
-  const { variantUrl, body } = await getPlaylist(page, videoHash);
-  const segmentPaths = body
-    .split("\n")
-    .map((l) => l.trim())
-    .filter((l) => l && !l.startsWith("#"));
-
-  const localPlaylist = [];
-  for (const line of body.split("\n")) {
-    const t = line.trim();
-    if (!t) {
-      localPlaylist.push("");
-      continue;
-    }
-    if (t.startsWith("#") || !/\.ts/i.test(t)) {
-      localPlaylist.push(line);
-      continue;
-    }
-    const name = t.split("/").pop().split("?")[0];
-    const idx = segmentPaths.indexOf(t);
-    onProgress?.(`Downloading segment ${idx + 1}/${segmentPaths.length}`);
-    const data = await downloadSegment(page, variantUrl, t);
-    fs.writeFileSync(path.join(workDir, name), data);
-    localPlaylist.push(name);
+  const cleanup = async () => {
+    try { await browser.close(); } catch { /* ignore */ }
+  };
+  if (signal) {
+    signal.addEventListener("abort", () => cleanup(), { once: true });
   }
 
-  await browser.close();
+  try {
+    onProgress?.("Opening course page in browser...");
+    await page.goto(pageUrl, { waitUntil: "networkidle", timeout: 120000 });
 
-  const m3u8Path = path.join(workDir, "playlist.m3u8");
-  fs.writeFileSync(m3u8Path, localPlaylist.join("\n"));
+    if (signal?.aborted) throw new Error("cancelled");
 
-  await new Promise((resolve, reject) => {
-    const ff = spawn(
-      "ffmpeg",
-      [
-        "-protocol_whitelist",
-        "file,http,https,tcp,tls,crypto",
-        "-i",
-        m3u8Path,
-        "-c",
-        "copy",
-        "-bsf:a",
-        "aac_adtstoasc",
-        "-movflags",
-        "+faststart",
-        "-y",
-        outPath,
-      ],
-      { stdio: "ignore", cwd: workDir }
-    );
-    ff.on("close", (code) => (code === 0 ? resolve() : reject(new Error(`ffmpeg ${code}`))));
-  });
+    onProgress?.("Fetching playlist...");
+    const { variantUrl, body } = await getPlaylist(page, videoHash);
+    const segmentPaths = body
+      .split("\n")
+      .map((l) => l.trim())
+      .filter((l) => l && !l.startsWith("#"));
 
-  fs.rmSync(workDir, { recursive: true, force: true });
+    const localPlaylist = [];
+    for (const line of body.split("\n")) {
+      if (signal?.aborted) throw new Error("cancelled");
+
+      const t = line.trim();
+      if (!t) {
+        localPlaylist.push("");
+        continue;
+      }
+      if (t.startsWith("#") || !/\.ts/i.test(t)) {
+        localPlaylist.push(line);
+        continue;
+      }
+      const name = t.split("/").pop().split("?")[0];
+      const idx = segmentPaths.indexOf(t);
+      onProgress?.(`Downloading segment ${idx + 1}/${segmentPaths.length}`);
+      const data = await downloadSegment(page, variantUrl, t);
+      fs.writeFileSync(path.join(workDir, name), data);
+      localPlaylist.push(name);
+    }
+
+    await browser.close();
+
+    const m3u8Path = path.join(workDir, "playlist.m3u8");
+    fs.writeFileSync(m3u8Path, localPlaylist.join("\n"));
+
+    await new Promise((resolve, reject) => {
+      const ff = spawn(
+        "ffmpeg",
+        [
+          "-protocol_whitelist",
+          "file,http,https,tcp,tls,crypto",
+          "-i",
+          m3u8Path,
+          "-c",
+          "copy",
+          "-bsf:a",
+          "aac_adtstoasc",
+          "-movflags",
+          "+faststart",
+          "-y",
+          outPath,
+        ],
+        { stdio: "ignore", cwd: workDir }
+      );
+      ff.on("close", (code) => (code === 0 ? resolve() : reject(new Error(`ffmpeg ${code}`))));
+    });
+
+    fs.rmSync(workDir, { recursive: true, force: true });
+  } catch (err) {
+    await cleanup();
+    fs.rmSync(workDir, { recursive: true, force: true });
+    throw err;
+  }
 }
 
 module.exports = { downloadMasterDevVideo };
