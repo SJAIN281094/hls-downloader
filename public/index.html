@@ -311,6 +311,61 @@
       white-space: pre-wrap;
       word-break: break-all;
     }
+
+    .divider {
+      border: none;
+      border-top: 1px solid var(--border);
+      margin: 28px 0;
+    }
+
+    .course-section h2 {
+      font-size: 1.1rem;
+      font-weight: 600;
+      margin-bottom: 6px;
+    }
+
+    .course-section p {
+      color: var(--text-dim);
+      font-size: 0.85rem;
+      margin-bottom: 14px;
+    }
+
+    .course-section input {
+      width: 100%;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--text);
+      font-size: 0.85rem;
+      padding: 10px 14px;
+      margin-bottom: 12px;
+    }
+
+    .course-section input:focus {
+      outline: none;
+      border-color: var(--accent);
+    }
+
+    .file-list {
+      margin-top: 12px;
+      max-height: 200px;
+      overflow-y: auto;
+      font-size: 0.8rem;
+    }
+
+    .file-list a {
+      display: block;
+      color: var(--accent);
+      text-decoration: none;
+      padding: 4px 0;
+    }
+
+    .file-list a:hover { text-decoration: underline; }
+
+    .btn-retry {
+      background: var(--orange);
+      color: #0f0f11;
+    }
   </style>
 </head>
 <body>
@@ -345,6 +400,15 @@ https://example.com/stream/index.m3u8"></textarea>
         </select>
       </div>
       <button class="primary" id="downloadBtn" onclick="startDownload()">Download</button>
+    </div>
+
+    <hr class="divider" />
+
+    <div class="course-section">
+      <h2>Or download entire course</h2>
+      <p>Paste a course page URL and the same curl above (with <code>fem_auth_mod</code> + <code>FM_EMCS</code> cookies). Completed lessons are skipped on retry.</p>
+      <input type="text" id="courseUrlInput" placeholder="https://frontendmasters.com/courses/permission-systems/" />
+      <button class="primary" id="courseBtn" onclick="startCourseDownload()">Download All Lessons</button>
     </div>
 
     <div class="jobs" id="jobs"></div>
@@ -386,11 +450,76 @@ https://example.com/stream/index.m3u8"></textarea>
       }
     }
 
-    function addJobCard(id, filename) {
+    async function startCourseDownload() {
+      const courseUrl = document.getElementById("courseUrlInput").value.trim();
+      const input = document.getElementById("curlInput").value.trim();
+      if (!courseUrl) {
+        alert("Enter a course URL like https://frontendmasters.com/courses/my-course/");
+        return;
+      }
+      if (!input) {
+        alert("Paste a curl from DevTools (with fem_auth_mod + FM_EMCS cookies) in the box above.");
+        return;
+      }
+
+      const speed = document.getElementById("speedInput").value;
+      const btn = document.getElementById("courseBtn");
+      btn.disabled = true;
+      btn.textContent = "Starting…";
+
+      try {
+        const res = await fetch("/api/download-course", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ courseUrl, input, speed }),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          alert(data.error || "Failed to start course download");
+          return;
+        }
+        addJobCard(data.jobId, courseUrl, "course");
+        pollStatus(data.jobId);
+      } catch (e) {
+        alert("Server error: " + e.message);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "Download All Lessons";
+      }
+    }
+
+    async function retryCourse(id) {
+      const input = document.getElementById("curlInput").value.trim();
+      if (!input) {
+        alert("Paste a fresh curl in the box above, then click Retry.");
+        return;
+      }
+      try {
+        const res = await fetch(`/api/retry/${id}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ input }),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          alert(data.error || "Retry failed");
+          return;
+        }
+        const card = document.getElementById(`job-${id}`);
+        const err = card?.querySelector(".error-text");
+        if (err) err.remove();
+        pollStatus(id);
+      } catch (e) {
+        alert("Server error: " + e.message);
+      }
+    }
+
+    function addJobCard(id, filename, mode = "single") {
       const container = document.getElementById("jobs");
       const card = document.createElement("div");
       card.className = "job-card";
       card.id = `job-${id}`;
+      card.dataset.mode = mode;
       card.innerHTML = `
         <div class="job-header">
           <span class="job-filename">${filename}</span>
@@ -440,7 +569,13 @@ https://example.com/stream/index.m3u8"></textarea>
       const bar = document.getElementById(`bar-${data.id}`);
       const meta = document.getElementById(`meta-${data.id}`);
       const actions = document.getElementById(`actions-${data.id}`);
+      const card = document.getElementById(`job-${data.id}`);
       if (!badge) return;
+
+      if (data.mode === "course" && data.courseTitle) {
+        const titleEl = card.querySelector(".job-filename");
+        if (titleEl) titleEl.textContent = data.courseTitle;
+      }
 
       const labels = { done: "Complete", downloading: "Downloading", queued: "Queued", error: "Error", cancelled: "Cancelled" };
       badge.textContent = labels[data.status] || data.status;
@@ -450,17 +585,52 @@ https://example.com/stream/index.m3u8"></textarea>
         meta.innerHTML = `<span>Waiting in queue… <strong>(${data.readRate}x throttle)</strong></span>`;
       } else if (data.status === "done") {
         bar.className = "progress-bar-inner done";
-        meta.innerHTML = `
-          <span>Duration: <strong>${data.progress || "—"}</strong></span>
-          <span>Size: <strong>${formatSize(data.fileSize)}</strong></span>
-          <span>Took: <strong>${formatDuration(data.elapsed)}</strong></span>
-        `;
-        actions.innerHTML = `<a class="btn-download" href="${data.downloadUrl}" download>Save File</a>`;
+        if (data.mode === "course") {
+          const n = data.lessonTotal || data.files?.length || 0;
+          meta.innerHTML = `
+            <span>Lessons: <strong>${n}</strong></span>
+            <span>Total size: <strong>${formatSize(data.fileSize || 0)}</strong></span>
+            <span>Took: <strong>${formatDuration(data.elapsed)}</strong></span>
+          `;
+          if (data.files?.length) {
+            let list = card.querySelector(".file-list");
+            if (!list) {
+              list = document.createElement("div");
+              list.className = "file-list";
+              card.appendChild(list);
+            }
+            list.innerHTML = data.files
+              .map((f) => `<a href="${f.downloadUrl}" download>${f.filename} (${formatSize(f.fileSize)})</a>`)
+              .join("");
+          }
+          actions.innerHTML = "";
+        } else {
+          meta.innerHTML = `
+            <span>Duration: <strong>${data.progress || "—"}</strong></span>
+            <span>Size: <strong>${formatSize(data.fileSize)}</strong></span>
+            <span>Took: <strong>${formatDuration(data.elapsed)}</strong></span>
+          `;
+          actions.innerHTML = `<a class="btn-download" href="${data.downloadUrl}" download>Save File</a>`;
+        }
       } else if (data.status === "error" || data.status === "cancelled") {
         bar.className = `progress-bar-inner error`;
-        actions.innerHTML = "";
+        let actionHtml = "";
+        if (data.mode === "course" && data.canRetry) {
+          actionHtml = `<button class="btn-retry" onclick="retryCourse('${data.id}')">Retry (resume)</button>`;
+        }
+        actions.innerHTML = actionHtml;
+        if (data.files?.length) {
+          let list = card.querySelector(".file-list");
+          if (!list) {
+            list = document.createElement("div");
+            list.className = "file-list";
+            card.appendChild(list);
+          }
+          list.innerHTML = data.files
+            .map((f) => `<a href="${f.downloadUrl}" download>${f.filename} (${formatSize(f.fileSize)})</a>`)
+            .join("");
+        }
         if (data.error) {
-          const card = document.getElementById(`job-${data.id}`);
           if (!card.querySelector(".error-text")) {
             const errDiv = document.createElement("div");
             errDiv.className = "error-text";
@@ -471,18 +641,34 @@ https://example.com/stream/index.m3u8"></textarea>
       } else {
         bar.className = "progress-bar-inner";
         let parts = [`<span>Elapsed: <strong>${formatDuration(data.elapsed)}</strong></span>`];
+        if (data.mode === "course") {
+          if (data.lessonTotal) {
+            parts.push(`<span>Lesson: <strong>${data.lessonIndex || 0}/${data.lessonTotal}</strong></span>`);
+          }
+        }
         if (data.progress) {
           if (/^\d{2}:\d{2}:\d{2}/.test(data.progress)) {
             parts.push(`<span>Time: <strong>${data.progress}</strong></span>`);
           } else {
             parts.push(`<span><strong>${data.progress}</strong></span>`);
           }
-        } else {
+        } else if (data.mode !== "course") {
           parts.push(`<span><strong>Downloading…</strong></span>`);
         }
         if (data.speed) parts.push(`<span>Speed: <strong>${data.speed}</strong></span>`);
         parts.push(`<span>Throttle: <strong>${data.readRate}x</strong></span>`);
         meta.innerHTML = parts.join("");
+        if (data.mode === "course" && data.files?.length) {
+          let list = card.querySelector(".file-list");
+          if (!list) {
+            list = document.createElement("div");
+            list.className = "file-list";
+            card.appendChild(list);
+          }
+          list.innerHTML = data.files
+            .map((f) => `<a href="${f.downloadUrl}" download>${f.filename} (${formatSize(f.fileSize)})</a>`)
+            .join("");
+        }
       }
     }
 

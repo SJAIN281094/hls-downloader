@@ -6,6 +6,8 @@ const crypto = require("crypto");
 const http = require("http");
 const https = require("https");
 const { downloadMasterDevVideo } = require("./masterdev-browser");
+const { downloadFrontendMastersParallel } = require("./fm-parallel");
+const { downloadCourse } = require("./fm-course");
 
 const app = express();
 const PORT = 3456;
@@ -492,11 +494,17 @@ async function prepareHlsInput(parsed) {
     }
   }
 
-  // ffmpeg does not reliably pass -headers (cookies) to HLS segment requests when
-  // the input is a local .m3u8 file. Use the remote playlist when no path/auth
-  // rewriting is required (e.g. frontendmasters.com with CloudFront cookies).
+  // ffmpeg does not reliably pass -headers to HLS segments from local .m3u8.
+  // Use remote playlist URL when no path/auth rewriting is needed.
+  const prepared = {
+    inputUrl: sourceUrl,
+    cleanup: null,
+    playlistBody: body,
+    playlistUrl: sourceUrl,
+  };
+
   if (!pathPrefix && !segAuth) {
-    return { inputUrl: sourceUrl, cleanup: null };
+    return prepared;
   }
 
   const tmpPath = path.join(
@@ -504,7 +512,9 @@ async function prepareHlsInput(parsed) {
     `playlist-${crypto.randomBytes(6).toString("hex")}.m3u8`
   );
   fs.writeFileSync(tmpPath, rewritten);
-  return { inputUrl: tmpPath, cleanup: tmpPath };
+  prepared.inputUrl = tmpPath;
+  prepared.cleanup = tmpPath;
+  return prepared;
 }
 
 // ---------------------------------------------------------------------------
@@ -588,6 +598,46 @@ app.post("/api/download", async (req, res) => {
       ? " Copy a fresh curl from your browser while the video is playing."
       : "";
     return res.status(400).json({ error: `Could not fetch playlist: ${msg}.${hint}` });
+  }
+
+  if (isFrontendMastersStream(parsed.url)) {
+    function startParallelJob() {
+      job.status = "downloading";
+      job.startedAt = Date.now();
+      job.abortController = new AbortController();
+
+      downloadFrontendMastersParallel(parsed, outPath, prepared, {
+        readRate,
+        signal: job.abortController.signal,
+        onProgress: (info) => {
+          if (info.phase === "mux") {
+            job.progress = "Muxing…";
+            return;
+          }
+          job.progress = `${info.done}/${info.total} segments`;
+          if (info.speed) job.speed = info.speed;
+        },
+      })
+        .then(() => {
+          const stats = fs.statSync(outPath);
+          job.status = "done";
+          job.fileSize = stats.size;
+          job.progress = "complete";
+          processQueue();
+        })
+        .catch((err) => {
+          if (job.status === "cancelled") return;
+          job.status = "error";
+          job.error = String(err.message || err);
+          processQueue();
+        });
+    }
+
+    const running = [...activeJobs.values()].filter((j) => j.status === "downloading").length;
+    if (running < MAX_CONCURRENT) startParallelJob();
+    else downloadQueue.push(startParallelJob);
+
+    return res.json({ jobId, filename: outName, readRate, mode: "parallel" });
   }
 
   function buildFfmpegArgs(inputUrl) {
@@ -688,6 +738,160 @@ app.post("/api/download", async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// API: Download entire course from a single course URL
+// ---------------------------------------------------------------------------
+function runCourseJob(job, authParsed) {
+  job.status = "downloading";
+  job.startedAt = Date.now();
+  job.error = null;
+  job.abortController = new AbortController();
+
+  const match = job.courseUrl.match(/\/courses\/([^/]+)/);
+  if (match) {
+    const slug = match[1];
+    job.courseSlug = slug;
+    const dir = path.join(DOWNLOADS_DIR, slug);
+    if (fs.existsSync(dir)) {
+      job.files = fs
+        .readdirSync(dir)
+        .filter((f) => f.endsWith(".mp4"))
+        .sort()
+        .map((filename) => ({
+          filename,
+          downloadUrl: `/downloads/${slug}/${filename}`,
+          fileSize: fs.statSync(path.join(dir, filename)).size,
+        }));
+      job.lessonIndex = job.files.length;
+    }
+  }
+
+  downloadCourse(authParsed, job.courseUrl, {
+    prepareHlsInput,
+    normalizeParsedInput,
+    downloadsDir: DOWNLOADS_DIR,
+  }, {
+    readRate: job.readRate,
+    signal: job.abortController.signal,
+    onLessonComplete: (entry) => {
+      const idx = job.files.findIndex((f) => f.filename === entry.filename);
+      if (idx >= 0) job.files[idx] = entry;
+      else job.files.push(entry);
+      job.files.sort((a, b) => a.filename.localeCompare(b.filename));
+      job.lessonIndex = job.files.length;
+    },
+    onProgress: (info) => {
+      if (info.courseTitle) job.courseTitle = info.courseTitle;
+      if (info.lessonTotal) job.lessonTotal = info.lessonTotal;
+      if (info.phase === "discover") {
+        job.progress = info.message;
+        return;
+      }
+      job.lessonIndex = info.lessonIndex || job.lessonIndex;
+      job.lessonTotal = info.lessonTotal || job.lessonTotal;
+      job.progress = info.message || job.progress;
+      if (info.speed) job.speed = info.speed;
+    },
+  })
+    .then((result) => {
+      job.status = "done";
+      job.courseTitle = result.courseTitle;
+      job.courseSlug = result.courseSlug;
+      job.files = result.lessons;
+      job.lessonTotal = result.lessons.length;
+      job.lessonIndex = result.lessons.length;
+      job.progress = `${result.lessons.length} lessons`;
+      job.fileSize = result.lessons.reduce((sum, f) => sum + f.fileSize, 0);
+      processQueue();
+    })
+    .catch((err) => {
+      if (job.status === "cancelled") return;
+      job.status = "error";
+      const msg = String(err.message || err);
+      job.error = /429/.test(msg)
+        ? "Frontend Masters API rate limit (429). Wait 1–2 minutes, then click Retry — completed lessons are skipped."
+        : msg;
+      processQueue();
+    });
+}
+
+app.post("/api/download-course", async (req, res) => {
+  const { courseUrl, input, speed } = req.body;
+  if (!courseUrl) return res.status(400).json({ error: "No course URL provided" });
+  if (!input) {
+    return res.status(400).json({
+      error: "Paste a curl from DevTools (any index.m3u8) so we can use your login cookies.",
+    });
+  }
+
+  const authParsed = parseCurlCommand(input);
+  if (!authParsed.cookies || !/fem_auth_mod=/.test(authParsed.cookies)) {
+    return res.status(400).json({
+      error: "Curl must include fem_auth_mod — copy it while logged in on frontendmasters.com.",
+    });
+  }
+  if (!/FM_EMCS=/.test(authParsed.cookies)) {
+    return res.status(400).json({
+      error: "Curl must include FM_EMCS — copy the full -b cookie line while a video is playing.",
+    });
+  }
+
+  const readRate = Math.max(0.5, Math.min(parseFloat(speed) || 1, 3));
+  const jobId = crypto.randomBytes(6).toString("hex");
+
+  const job = {
+    id: jobId,
+    filename: `course-${jobId}`,
+    status: "queued",
+    progress: "",
+    speed: "",
+    readRate,
+    error: null,
+    startedAt: Date.now(),
+    mode: "course",
+    courseUrl,
+    courseTitle: "",
+    lessonIndex: 0,
+    lessonTotal: 0,
+    files: [],
+    authInput: input,
+  };
+  activeJobs.set(jobId, job);
+
+  const running = [...activeJobs.values()].filter((j) => j.status === "downloading").length;
+  if (running < MAX_CONCURRENT) runCourseJob(job, authParsed);
+  else downloadQueue.push(() => runCourseJob(job, authParsed));
+
+  res.json({ jobId, mode: "course", readRate });
+});
+
+app.post("/api/retry/:id", (req, res) => {
+  const job = activeJobs.get(req.params.id);
+  if (!job) return res.status(404).json({ error: "Job not found" });
+  if (job.mode !== "course") return res.status(400).json({ error: "Retry is only for course downloads" });
+  if (job.status !== "error" && job.status !== "cancelled") {
+    return res.status(400).json({ error: "Job is not in a retryable state" });
+  }
+
+  const input = req.body?.input || job.authInput;
+  if (!input) return res.status(400).json({ error: "Paste a fresh curl, then click Retry" });
+
+  const authParsed = parseCurlCommand(input);
+  if (!authParsed.cookies || !/fem_auth_mod=/.test(authParsed.cookies)) {
+    return res.status(400).json({ error: "Curl must include fem_auth_mod cookie" });
+  }
+
+  job.authInput = input;
+  job.error = null;
+  job.progress = "Resuming…";
+
+  const running = [...activeJobs.values()].filter((j) => j.status === "downloading").length;
+  if (running < MAX_CONCURRENT) runCourseJob(job, authParsed);
+  else downloadQueue.push(() => runCourseJob(job, authParsed));
+
+  res.json({ ok: true, jobId: job.id });
+});
+
+// ---------------------------------------------------------------------------
 // API: Job status
 // ---------------------------------------------------------------------------
 app.get("/api/status/:id", (req, res) => {
@@ -703,11 +907,25 @@ app.get("/api/status/:id", (req, res) => {
     readRate: job.readRate,
     error: job.error,
     elapsed: Math.round((Date.now() - job.startedAt) / 1000),
+    mode: job.mode || "single",
   };
 
-  if (job.status === "done") {
+  if (job.mode === "course") {
+    result.courseTitle = job.courseTitle;
+    result.courseSlug = job.courseSlug;
+    result.lessonIndex = job.lessonIndex;
+    result.lessonTotal = job.lessonTotal;
+    result.canRetry = job.status === "error" || job.status === "cancelled";
+    if (job.files?.length) result.files = job.files;
+  }
+
+  if (job.status === "done" && job.mode !== "course") {
     result.fileSize = job.fileSize;
     result.downloadUrl = `/downloads/${job.filename}`;
+  }
+
+  if (job.status === "done" && job.mode === "course") {
+    result.fileSize = job.fileSize;
   }
 
   res.json(result);
@@ -719,6 +937,7 @@ app.get("/api/status/:id", (req, res) => {
 app.post("/api/cancel/:id", (req, res) => {
   const job = activeJobs.get(req.params.id);
   if (!job) return res.status(404).json({ error: "Job not found" });
+  if (job.abortController) job.abortController.abort(new Error("cancelled"));
   if (job.proc) job.proc.kill("SIGTERM");
   job.status = "cancelled";
   res.json({ ok: true });
